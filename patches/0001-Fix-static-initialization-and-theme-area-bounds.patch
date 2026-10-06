@@ -1,0 +1,446 @@
+From 2cd2517a0a1edcee885ee5996971d54bc8356b85 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 6 Oct 2026 19:44:32 +0000
+Subject: [PATCH] Fix static initialization and theme area bounds
+
+userland_B.ld set ALLOW_INIT_ARRAY = 1, but the production userland is
+linked with rt0_no_init_array.cpp, so .init_array is never executed.
+Every global initialized from a (now mutable) Palette color stayed zero:
+the Python turtle object, curve color names/picker, plot pattern
+transparency, sum graph legend format, Python selection highlight and
+USB screen colors. Restore the linker guard and make these values
+constant-initialized or computed at use time.
+
+Also bound-check every offset/size read from the Theme Area before
+dereferencing it, skip the Theme Area on the simulator (fixed device
+address), and restore shared/ion/src/shared/dummy/init.cpp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01S8rZuXVCv5NTE5FNLjFwki
+---
+ epsilon/apps/code/python_text_area.cpp        | 16 +++---
+ epsilon/apps/shared/color_names.cpp           |  4 +-
+ epsilon/apps/shared/color_names.h             | 16 ++++--
+ .../shared/color_parameter_controller.cpp     |  6 +--
+ epsilon/apps/shared/plot_view_plots.h         |  7 ++-
+ epsilon/apps/shared/sum_graph_controller.cpp  |  6 +--
+ epsilon/apps/shared/sum_graph_controller.h    |  7 +--
+ epsilon/apps/theme_manager.cpp                | 49 +++++++++++++++----
+ epsilon/apps/usb/usb_connected_controller.cpp | 15 ++++--
+ epsilon/python/port/mod/turtle/turtle.h       |  2 +-
+ .../src/device/userland/flash/userland_B.ld   |  2 +-
+ shared/ion/src/shared/dummy/init.cpp          | 30 ++----------
+ 12 files changed, 93 insertions(+), 67 deletions(-)
+
+diff --git a/epsilon/apps/code/python_text_area.cpp b/epsilon/apps/code/python_text_area.cpp
+index df879a8..90276d7 100644
+--- a/epsilon/apps/code/python_text_area.cpp
++++ b/epsilon/apps/code/python_text_area.cpp
+@@ -34,7 +34,9 @@ static inline KDColor OperatorColor = KDColor::RGB24(0xd73a49);
+ static inline KDColor StringColor = KDColor::RGB24(0x032f62);
+ static inline KDColor AutocompleteColor = KDColor::RGB24(0xC6C6C6);
+ static inline KDColor BackgroundColor = KDColorWhite;
+-static inline KDColor HighlightColor = Palette::Select;
++// Function, not a variable: Palette::Select is mutable (themes), and a static
++// initialized from it would never be initialized on device (no .init_array).
++static inline KDColor HighlightColor() { return Palette::Select; }
+ static inline KDColor DefaultColor = KDColorBlack;
+ 
+ static inline KDColor TokenColor(mp_token_kind_t tokenKind) {
+@@ -281,7 +283,7 @@ void PythonTextArea::ContentView::drawLine(KDContext* ctx, int line,
+     drawStringAt(ctx, line, fromColumn, spacesStart,
+                  std::min(text + byteLength, firstNonSpace) - spacesStart,
+                  StringColor, BackgroundColor, selectionStart, selectionEnd,
+-                 HighlightColor);
++                 HighlightColor());
+   }
+   if (UTF8Helper::CodePointIs(firstNonSpace, UCodePointNull)) {
+     return;
+@@ -306,7 +308,7 @@ void PythonTextArea::ContentView::drawLine(KDContext* ctx, int line,
+             ctx, line, UTF8Helper::GlyphOffsetAtCodePoint(text, tokenEnd),
+             tokenEnd, std::min(text + byteLength, tokenFrom) - tokenEnd,
+             StringColor, BackgroundColor, selectionStart, selectionEnd,
+-            HighlightColor);
++            HighlightColor());
+       }
+       tokenLength = TokenLength(lex, tokenFrom);
+       tokenEnd = tokenFrom + tokenLength;
+@@ -359,7 +361,7 @@ void PythonTextArea::ContentView::drawLine(KDContext* ctx, int line,
+       drawStringAt(ctx, line,
+                    UTF8Helper::GlyphOffsetAtCodePoint(text, tokenFrom),
+                    tokenFrom, tokenLength, color, BackgroundColor,
+-                   selectionStart, selectionEnd, HighlightColor);
++                   selectionStart, selectionEnd, HighlightColor());
+ 
+       if (skipCombining) {
+         mp_lexer_to_next(lex);
+@@ -377,7 +379,7 @@ void PythonTextArea::ContentView::drawLine(KDContext* ctx, int line,
+       drawStringAt(
+           ctx, line, UTF8Helper::GlyphOffsetAtCodePoint(text, tokenFrom),
+           tokenFrom, text + byteLength - tokenFrom, CommentColor,
+-          BackgroundColor, selectionStart, selectionEnd, HighlightColor);
++          BackgroundColor, selectionStart, selectionEnd, HighlightColor());
+     }
+ 
+     mp_lexer_free(lex);
+@@ -385,7 +387,7 @@ void PythonTextArea::ContentView::drawLine(KDContext* ctx, int line,
+   } else {  // Uncaught exception
+     MicroPython::ExecutionEnvironment::HandleExceptionSilently();
+     drawStringAt(ctx, line, fromColumn, text, byteLength, DefaultColor,
+-                 BackgroundColor, selectionStart, selectionEnd, HighlightColor);
++                 BackgroundColor, selectionStart, selectionEnd, HighlightColor());
+   }
+ 
+   // Redraw the autocompleted word in the right color
+@@ -397,7 +399,7 @@ void PythonTextArea::ContentView::drawLine(KDContext* ctx, int line,
+         ctx, line, UTF8Helper::GlyphOffsetAtCodePoint(text, autocompleteStart),
+         autocompleteStart,
+         std::min(text + byteLength, m_autocompletionEnd) - autocompleteStart,
+-        AutocompleteColor, BackgroundColor, nullptr, nullptr, HighlightColor);
++        AutocompleteColor, BackgroundColor, nullptr, nullptr, HighlightColor());
+   }
+ }
+ 
+diff --git a/epsilon/apps/shared/color_names.cpp b/epsilon/apps/shared/color_names.cpp
+index 70e9941..9712895 100644
+--- a/epsilon/apps/shared/color_names.cpp
++++ b/epsilon/apps/shared/color_names.cpp
+@@ -2,7 +2,7 @@
+ 
+ I18n::Message Shared::ColorNames::NameForColor(KDColor color) {
+   for (int i = 0; i < k_count; i++) {
+-    if (color == k_colors[i]) {
++    if (color == ColorAtIndex(i)) {
+       return k_messages[i];
+     }
+   }
+@@ -11,7 +11,7 @@ I18n::Message Shared::ColorNames::NameForColor(KDColor color) {
+ 
+ I18n::Message Shared::ColorNames::NameForCurveColor(KDColor color) {
+   for (int i = 0; i < k_count; i++) {
+-    if (color == k_colors[i]) {
++    if (color == ColorAtIndex(i)) {
+       return k_curveMessages[i];
+     }
+   }
+diff --git a/epsilon/apps/shared/color_names.h b/epsilon/apps/shared/color_names.h
+index 28fd2f5..119eef9 100644
+--- a/epsilon/apps/shared/color_names.h
++++ b/epsilon/apps/shared/color_names.h
+@@ -8,11 +8,17 @@ namespace Shared {
+ namespace ColorNames {
+ 
+ constexpr static int k_count = 8;
+-static inline KDColor k_colors[k_count] = {
+-    Escher::Palette::Red,     Escher::Palette::Blue,
+-    Escher::Palette::Green,   Escher::Palette::YellowDark,
+-    Escher::Palette::Magenta, Escher::Palette::Turquoise,
+-    Escher::Palette::Pink,    Escher::Palette::Orange};
++/* Pointers rather than copies: the Palette colors are mutable (themes), so an
++ * array initialized from their values would need a dynamic initializer, which
++ * never runs on device (no .init_array). Taking their address is a constant
++ * expression. */
++static inline KDColor* const k_colorPointers[k_count] = {
++    &Escher::Palette::Red,     &Escher::Palette::Blue,
++    &Escher::Palette::Green,   &Escher::Palette::YellowDark,
++    &Escher::Palette::Magenta, &Escher::Palette::Turquoise,
++    &Escher::Palette::Pink,    &Escher::Palette::Orange};
++
++inline KDColor ColorAtIndex(int i) { return *k_colorPointers[i]; }
+ 
+ constexpr static I18n::Message k_messages[k_count] = {
+     I18n::Message::ColorRed,     I18n::Message::ColorBlue,
+diff --git a/epsilon/apps/shared/color_parameter_controller.cpp b/epsilon/apps/shared/color_parameter_controller.cpp
+index 44b88d0..6e7d567 100644
+--- a/epsilon/apps/shared/color_parameter_controller.cpp
++++ b/epsilon/apps/shared/color_parameter_controller.cpp
+@@ -12,7 +12,7 @@ void ColorParameterController::viewWillAppear() {
+   int functionColorIndex = 0;
+   KDColor functionColor = function()->color(m_derivationOrder);
+   for (int i = 0; i < ColorNames::k_count; i++) {
+-    if (functionColor == ColorNames::k_colors[i]) {
++    if (functionColor == ColorNames::ColorAtIndex(i)) {
+       functionColorIndex = i;
+       break;
+     }
+@@ -24,7 +24,7 @@ bool ColorParameterController::handleEvent(Ion::Events::Event event) {
+   StackViewController* stack =
+       static_cast<StackViewController*>(parentResponder());
+   if (event == Ion::Events::OK || event == Ion::Events::EXE) {
+-    KDColor selectedColor = ColorNames::k_colors[selectedRow()];
++    KDColor selectedColor = ColorNames::ColorAtIndex(selectedRow());
+     function()->setColor(selectedColor, m_derivationOrder);
+     // Pop all the way back
+     stack->popUntilDepth(
+@@ -43,7 +43,7 @@ void ColorParameterController::fillCellForRow(HighlightCell* cell, int row) {
+   assert(row >= 0);
+   assert(row < ColorNames::k_count);
+   colorCell->label()->setMessage(ColorNames::k_messages[row]);
+-  colorCell->accessory()->setColor(ColorNames::k_colors[row]);
++  colorCell->accessory()->setColor(ColorNames::ColorAtIndex(row));
+ }
+ 
+ void ColorParameterController::setRecord(Ion::Storage::Record record,
+diff --git a/epsilon/apps/shared/plot_view_plots.h b/epsilon/apps/shared/plot_view_plots.h
+index f296cf3..fa195b3 100644
+--- a/epsilon/apps/shared/plot_view_plots.h
++++ b/epsilon/apps/shared/plot_view_plots.h
+@@ -74,8 +74,11 @@ class WithCurves {
+ 
+    private:
+     constexpr static size_t k_size = 4;
+-    static inline KDColor k_transparent =
+-        AbstractPlotView::k_backgroundColor;
++    /* Must stay a constant expression: reading the mutable
++     * AbstractPlotView::k_backgroundColor here would need a dynamic
++     * initializer, which never runs on device (no .init_array). Keep it in
++     * sync with AbstractPlotView::k_backgroundColor's initial value. */
++    constexpr static KDColor k_transparent = KDColorWhite;
+ 
+     KDColor m_c0, m_c1, m_c2, m_c3, m_cBackground;
+   };
+diff --git a/epsilon/apps/shared/sum_graph_controller.cpp b/epsilon/apps/shared/sum_graph_controller.cpp
+index e4e436c..fba51f5 100644
+--- a/epsilon/apps/shared/sum_graph_controller.cpp
++++ b/epsilon/apps/shared/sum_graph_controller.cpp
+@@ -233,10 +233,10 @@ Poincare::SystemExpression SumGraphController::createSumExpression(
+ /* Legend View */
+ 
+ SumGraphController::LegendView::LegendView(SumGraphController* controller)
+-    : m_sum(k_glyphsFormat),
+-      m_legend(I18n::Message::Default, k_glyphsFormat),
++    : m_sum(GlyphsFormat()),
++      m_legend(I18n::Message::Default, GlyphsFormat()),
+       m_editableZone(controller, m_textBuffer, k_editableZoneBufferSize,
+-                     controller, k_glyphsFormat) {
++                     controller, GlyphsFormat()) {
+   m_textBuffer[0] = 0;
+ }
+ 
+diff --git a/epsilon/apps/shared/sum_graph_controller.h b/epsilon/apps/shared/sum_graph_controller.h
+index 0995244..fa528d4 100644
+--- a/epsilon/apps/shared/sum_graph_controller.h
++++ b/epsilon/apps/shared/sum_graph_controller.h
+@@ -89,9 +89,10 @@ class SumGraphController : public SimpleInteractiveCurveViewController {
+         Poincare::PrintFloat::charSizeForFloatsWithPrecision(k_valuesPrecision);
+     constexpr static KDCoordinate k_legendHeight = 35;
+     constexpr static KDFont::Size k_font = KDFont::Size::Small;
+-    static inline KDGlyph::Format k_glyphsFormat = {
+-        .style = {.backgroundColor = Escher::Palette::GrayMiddle,
+-                  .font = k_font}};
++    static KDGlyph::Format GlyphsFormat() {
++      return {.style = {.backgroundColor = Escher::Palette::GrayMiddle,
++                        .font = k_font}};
++    }
+ 
+     int numberOfSubviews() const override { return 3; }
+     Escher::View* subviewAtIndex(int index) override;
+diff --git a/epsilon/apps/theme_manager.cpp b/epsilon/apps/theme_manager.cpp
+index a6dafd1..edc1791 100644
+--- a/epsilon/apps/theme_manager.cpp
++++ b/epsilon/apps/theme_manager.cpp
+@@ -14,6 +14,12 @@ bool ThemeManager::s_valid = false;
+ int ThemeManager::s_selectedTheme = 0;
+ 
+ void ThemeManager::init() {
++#if !PLATFORM_DEVICE
++  // The Theme Area is a fixed external flash address: it is not mapped on the
++  // simulator, where dereferencing it would segfault at boot.
++  s_valid = false;
++  return;
++#endif
+   const ThemeAreaHeader* h =
+       reinterpret_cast<const ThemeAreaHeader*>(ThemeAreaStart);
+ 
+@@ -59,6 +65,14 @@ const ThemeEntry* ThemeManager::currentEntry() {
+ 
+ namespace {
+ 
++/* Offsets and sizes come from flash and may be garbage (Theme Area partially
++ * overwritten, e.g. by external apps of slot A installed over it): never
++ * dereference anything that is not fully inside the Theme Area. */
++bool inThemeArea(uint32_t offset, uint32_t size) {
++  return offset != 0 && offset <= ThemeAreaSize &&
++         size <= ThemeAreaSize - offset;
++}
++
+ /* Matches the blob layout written by generate_theme.py's
+  * png_to_lz4_wallpaper_blob():
+  *   uint32 width, height, chunkRows, chunkCount;
+@@ -88,23 +102,23 @@ const WallpaperBlobHeader* wallpaperBlobHeader(const ThemeEntry* e) {
+ 
+ bool ThemeManager::hasWallpaper() {
+   const ThemeEntry* e = currentEntry();
+-  return e != nullptr && e->isWallpaper && e->wallpaperOffset != 0;
++  return e != nullptr && e->isWallpaper &&
++         inThemeArea(e->wallpaperOffset, e->wallpaperSize) &&
++         e->wallpaperSize >= sizeof(WallpaperBlobHeader);
+ }
+ 
+ int ThemeManager::wallpaperWidth() {
+-  const ThemeEntry* e = currentEntry();
+-  if (!e || !e->wallpaperOffset) {
++  if (!hasWallpaper()) {
+     return 0;
+   }
+-  return (int)wallpaperBlobHeader(e)->width;
++  return (int)wallpaperBlobHeader(currentEntry())->width;
+ }
+ 
+ int ThemeManager::wallpaperHeight() {
+-  const ThemeEntry* e = currentEntry();
+-  if (!e || !e->wallpaperOffset) {
++  if (!hasWallpaper()) {
+     return 0;
+   }
+-  return (int)wallpaperBlobHeader(e)->height;
++  return (int)wallpaperBlobHeader(currentEntry())->height;
+ }
+ 
+ const KDColor* ThemeManager::wallpaperChunkContaining(int globalY, int* localY) {
+@@ -120,9 +134,16 @@ const KDColor* ThemeManager::wallpaperChunkContaining(int globalY, int* localY)
+ 
+   const WallpaperBlobHeader* header = wallpaperBlobHeader(e);
+   if (globalY >= (int)header->height || header->width > (uint32_t)k_maxChunkWidth ||
+-      header->chunkRows > (uint32_t)k_maxChunkHeight) {
++      header->chunkRows == 0 || header->chunkRows > (uint32_t)k_maxChunkHeight) {
+     return nullptr;
+   }
++  // The offsets/sizes tables and the chunk data must fit in the blob.
++  uint32_t blobSize = e->wallpaperSize;
++  uint32_t tablesEnd = sizeof(WallpaperBlobHeader);
++  if (header->chunkCount > (blobSize - tablesEnd) / (2 * sizeof(uint32_t))) {
++    return nullptr;
++  }
++  tablesEnd += 2 * sizeof(uint32_t) * header->chunkCount;
+ 
+   int chunkIndex = globalY / (int)header->chunkRows;
+   if (chunkIndex < 0 || chunkIndex >= (int)header->chunkCount) {
+@@ -144,6 +165,12 @@ const KDColor* ThemeManager::wallpaperChunkContaining(int globalY, int* localY)
+     }
+     int dstSize = chunkRows * (int)header->width * sizeof(KDColor);
+ 
++    uint32_t available = blobSize - tablesEnd;
++    if (offsets[chunkIndex] > available ||
++        sizes[chunkIndex] > available - offsets[chunkIndex]) {
++      return nullptr;
++    }
++
+     OMG::Memory::Decompress(chunksData + offsets[chunkIndex],
+                             reinterpret_cast<uint8_t*>(s_chunkBuffer),
+                             sizes[chunkIndex], dstSize);
+@@ -200,7 +227,8 @@ int ThemeManager::iconIndexForApp(I18n::Message appName) {
+ 
+ bool ThemeManager::hasPalette() {
+   const ThemeEntry* e = currentEntry();
+-  return e != nullptr && e->isPalette && e->paletteOffset != 0;
++  return e != nullptr && e->isPalette &&
++         inThemeArea(e->paletteOffset, e->paletteSize);
+ }
+ 
+ void ThemeManager::applyPalette() {
+@@ -243,7 +271,8 @@ bool ThemeManager::isAppNameBackgroundHover() {
+ bool ThemeManager::hasIcon(int iconIndex) {
+   const ThemeEntry* e = currentEntry();
+   return e != nullptr && e->isIcons && iconIndex >= 0 &&
+-         iconIndex < (int)ThemeIconCount && e->iconOffsets[iconIndex] != 0;
++         iconIndex < (int)ThemeIconCount &&
++         inThemeArea(e->iconOffsets[iconIndex], e->iconSizes[iconIndex]);
+ }
+ 
+ const KDColor* ThemeManager::iconPixels(int iconIndex, int iconWidth,
+diff --git a/epsilon/apps/usb/usb_connected_controller.cpp b/epsilon/apps/usb/usb_connected_controller.cpp
+index ea33f8b..d843775 100644
+--- a/epsilon/apps/usb/usb_connected_controller.cpp
++++ b/epsilon/apps/usb/usb_connected_controller.cpp
+@@ -11,12 +11,19 @@ constexpr I18n::Message sUSBConnectedMessages[] = {
+     I18n::Message::BlankMessage,      I18n::Message::ConnectedMessage3,
+     I18n::Message::ConnectedMessage4, I18n::Message::ConnectedMessage5};
+ 
+-static inline KDColor sUSBConnectedColors[] = {
+-    KDColorBlack, KDColorBlack, KDColorBlack, Escher::Palette::YellowDark,
+-    KDColorWhite, KDColorBlack, KDColorBlack, KDColorBlack};
++/* Filled at call time: Palette::YellowDark is mutable (themes), so reading it
++ * in a static initializer would need a dynamic initializer, which never runs
++ * on device (no .init_array). MessageView copies the colors. */
++static const KDColor* USBConnectedColors() {
++  static KDColor s_colors[] = {KDColorBlack, KDColorBlack, KDColorBlack,
++                               KDColorBlack, KDColorWhite, KDColorBlack,
++                               KDColorBlack, KDColorBlack};
++  s_colors[3] = Escher::Palette::YellowDark;
++  return s_colors;
++}
+ 
+ USBConnectedController::USBConnectedController()
+     : ViewController(nullptr),
+-      m_messageView(sUSBConnectedMessages, sUSBConnectedColors, 8) {}
++      m_messageView(sUSBConnectedMessages, USBConnectedColors(), 8) {}
+ 
+ }  // namespace USB
+diff --git a/epsilon/python/port/mod/turtle/turtle.h b/epsilon/python/port/mod/turtle/turtle.h
+index 3e36b31..c200969 100644
+--- a/epsilon/python/port/mod/turtle/turtle.h
++++ b/epsilon/python/port/mod/turtle/turtle.h
+@@ -94,7 +94,7 @@ class Turtle {
+       Escher::Metric::DisplayHeightWithoutTitleBar / 2;
+   constexpr static uint8_t k_defaultSpeed = 8;
+   constexpr static uint8_t k_maxSpeed = 10;
+-  static inline KDColor k_defaultColor = KDColorBlack;
++  constexpr static KDColor k_defaultColor = KDColorBlack;
+   constexpr static uint8_t k_defaultPenSize = 1;
+   constexpr static KDFont::Size k_font = KDFont::Size::Large;
+   constexpr static mp_float_t k_maxPosition = KDCOORDINATE_MAX * 0.75f;
+diff --git a/shared/ion/src/device/userland/flash/userland_B.ld b/shared/ion/src/device/userland/flash/userland_B.ld
+index 1d19034..f95b03e 100644
+--- a/shared/ion/src/device/userland/flash/userland_B.ld
++++ b/shared/ion/src/device/userland/flash/userland_B.ld
+@@ -1,6 +1,6 @@
+ INCLUDE board.ld
+ 
+ EPSILON_OFFSET = SlotBOffset;
+-ALLOW_INIT_ARRAY = 1;
++ALLOW_INIT_ARRAY = 0;
+ 
+ INCLUDE userland_shared.ld
+diff --git a/shared/ion/src/shared/dummy/init.cpp b/shared/ion/src/shared/dummy/init.cpp
+index 5f6e31d..93745da 100644
+--- a/shared/ion/src/shared/dummy/init.cpp
++++ b/shared/ion/src/shared/dummy/init.cpp
+@@ -1,29 +1,7 @@
+-#include "init.h"
++#include <ion/src/shared/init.h>
+ 
+-#include <escher/init.h>
+-#include <poincare/init.h>
++namespace Ion {
+ 
+-#include "apps_container_storage.h"
+-#include "exam_mode_manager.h"
+-#include "global_preferences.h"
+-#include "shared/global_store.h"
+-#include "theme_manager.h"
++void Init() {}
+ 
+-namespace Apps {
+-
+-void Init() {
+-  Shared::GlobalStore::Init();
+-  GlobalPreferences::Init();
+-  ExamModeManager::Init();
+-  Shared::GlobalContextAccessor::Init();
+-  Poincare::Init(GlobalPreferences::SharedGlobalPreferences(),
+-                 ExamModeManager::ExamModePtr(),
+-                 &Shared::GlobalContextAccessor::SequenceContext());
+-  Escher::Init(GlobalPreferences::SharedGlobalPreferences());
+-
+-  ThemeManager::init();
+-
+-  ::AppsContainerStorage::sharedAppsContainerStorage.init();
+-}
+-
+-}  // namespace Apps
+\ No newline at end of file
++}  // namespace Ion
+-- 
+2.43.0
+
