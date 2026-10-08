@@ -81,22 +81,24 @@ Vérifié : après correction, l'édition de liens passe avec le garde-fou réta
 - `theme_manager.h` inclut en dur `n0120/config/board.h` pour tous les modèles. Ça fonctionne parce que les valeurs sont identiques, mais c'est fragile.
 - **ABLauncher** : `SLOT_A_HEADER_SIZE = 0x20000` suppose la disposition officielle du n0120 (avec « extra data »). Sur n0110/n0115, le userland officiel du slot A est à `0x90010000`, donc le retour B → A saute au milieu du code. On finit sur A quand même, mais par un plantage.
 
-## 4. Cas N0115 : le fichier publié
+## 4. Cas N0120 (ta calculatrice) : le fichier publié
 
-J'ai téléchargé et décodé `userland.allow3rdparty.B.n0115.dfu` de la release **Salty-OS-v1.0** (sha256 `4848d972…`).
+J'ai téléchargé et décodé `userland.allow3rdparty.B.n0120.dfu` de la release **Salty-OS-v1.0** (sha256 `23ec92eb…`).
 
-- **Le fichier est correct pour un N0115** :
-  - userland à `0x90410000`, là où ABLauncher saute ;
-  - pile initiale `0x2003eff8`, dans la RAM du N0115 (`0x20000000`) ;
+- **Le fichier est correct pour un N0120** :
+  - userland à `0x90410000`, exactement là où ABLauncher saute (`0x90410030`) ;
+  - pile initiale `0x2403eff8`, dans la RAM du N0120 (`0x24000000`) ;
+  - point d'entrée `0x90477ee1`, qui pointe bien sur le code de démarrage (copie de `.data`) ;
   - en-tête valide (magic `0xDEC0EDFE`, version `26.3.0`).
 - **La release v1.0 a été compilée depuis un ancien commit** (`76ad24d`), pas depuis le code actuel. Ce commit n'a **ni** le système de thèmes **ni** `ALLOW_INIT_ARRAY = 1`. Les bugs 1 à 4 ci-dessus concernent le code actuel (`master`), **pas** ce fichier. Ses modifications par rapport à Epsilon sont minimes (palette rose constante, fond d'écran intégré, `unsetCheckpoint(Home)`) et je n'y vois rien qui plante au démarrage.
+- Le N0120 est le modèle que l'auteur a le plus testé (en 26.3.0). Le problème vient donc très probablement de l'**environnement** : version d'Epsilon, slot en cours d'exécution, ou installation.
 - **Ce fichier contient 2 blocs** :
-  - le userland (`0x90410000`, 1,45 Mo) ;
+  - le userland (`0x90410000`, 1,40 Mo) ;
   - **64 Ko de `0xFF` à `0x907F0000`** : les « persisting bytes » du slot B (nom de l'appareil, octets du mode examen).
 
 L'installeur web **efface tous les blocs d'abord, puis écrit**. Si le noyau refuse l'effacement de `0x907F0000`, l'installeur s'arrête sur une erreur. Les octets du mode examen sont typiquement protégés, mais je ne peux pas le vérifier : le code du noyau n'est pas public. Le userland vient alors **d'être effacé et n'est jamais réécrit**. ABLauncher saute ensuite dans une zone vide (`0xFFFFFFFF`), ce qui fait planter la calculatrice, et elle redémarre sur A.
 
-`dfu/userland.allow3rdparty.B.n0115.sans-persisting-bytes.dfu` est le **même userland, octet pour octet**, sans le bloc `0x907F0000`. Il est produit par `tools/strip_dfu.py`, avec CRC et taille vérifiés. Il est utile si l'installeur affichait une erreur avec le fichier d'origine.
+`dfu/userland.allow3rdparty.B.n0120.sans-persisting-bytes.dfu` est le **même userland, octet pour octet**, sans le bloc `0x907F0000`. Il est produit par `tools/strip_dfu.py`, avec CRC et taille vérifiés. Il est utile si l'installeur affichait une erreur avec le fichier d'origine.
 
 ## 5. Fichiers fournis
 
@@ -104,13 +106,11 @@ L'installeur web **efface tous les blocs d'abord, puis écrit**. Si le noyau ref
   ```sh
   git clone https://github.com/SaltyMold/Salty-OS && cd Salty-OS
   git am ../Debug-Script-Calculatrice/patches/0001-Fix-static-initialization-and-theme-area-bounds.patch
-  cd epsilon && make -j$(nproc) PLATFORM=n0120 userland.allow3rdparty.B.dfu   # adapter le modèle
+  cd epsilon && make -j$(nproc) PLATFORM=n0120 userland.allow3rdparty.B.dfu
   ```
-
-Compilation vérifiée avec le patch : n0120, n0115 et n0110 (`.init_array` vide sur les trois).
-**Non testé sur une vraie calculatrice** : je n'ai pas de matériel ici. Ce patch corrige les bugs ci-dessus, mais il ne garantit pas, à lui seul, que le saut vers le slot B fonctionnera si la cause est le modèle, la version ou l'installation (section 2).
-- `dfu/userland.allow3rdparty.B.n0115.sans-persisting-bytes.dfu` : le userland officiel v1.0 pour N0115, sans le bloc `0x907F0000` (section 4).
+  Compilation vérifiée avec le patch : n0120, n0115 et n0110 (`.init_array` vide sur les trois). **Non testé sur une vraie calculatrice** : ce patch corrige les bugs ci-dessus, mais il ne garantit pas, à lui seul, que le saut vers le slot B fonctionnera si la cause est la version ou l'installation (section 2).
+- `dfu/userland.allow3rdparty.B.n0120.sans-persisting-bytes.dfu` : le userland officiel v1.0 pour N0120, sans le bloc `0x907F0000` (section 4).
 - `tools/strip_dfu.py` : script qui a produit ce fichier :
   ```sh
-  python3 tools/strip_dfu.py userland.allow3rdparty.B.n0115.dfu sortie.dfu 90410000
+  python3 tools/strip_dfu.py userland.allow3rdparty.B.n0120.dfu sortie.dfu 90410000
   ```
