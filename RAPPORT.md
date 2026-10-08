@@ -96,11 +96,44 @@ J'ai téléchargé et décodé `userland.allow3rdparty.B.n0120.dfu` de la releas
   - le userland (`0x90410000`, 1,40 Mo) ;
   - **64 Ko de `0xFF` à `0x907F0000`** : les « persisting bytes » du slot B (nom de l'appareil, octets du mode examen).
 
-L'installeur web **efface tous les blocs d'abord, puis écrit**. Si le noyau refuse l'effacement de `0x907F0000`, l'installeur s'arrête sur une erreur. Les octets du mode examen sont typiquement protégés, mais je ne peux pas le vérifier : le code du noyau n'est pas public. Le userland vient alors **d'être effacé et n'est jamais réécrit**. ABLauncher saute ensuite dans une zone vide (`0xFFFFFFFF`), ce qui fait planter la calculatrice, et elle redémarre sur A.
+`dfu/userland.allow3rdparty.B.n0120.sans-persisting-bytes.dfu` est le **même userland, octet pour octet**, sans le bloc `0x907F0000`. Il est produit par `tools/strip_dfu.py`, avec CRC et taille vérifiés.
 
-`dfu/userland.allow3rdparty.B.n0120.sans-persisting-bytes.dfu` est le **même userland, octet pour octet**, sans le bloc `0x907F0000`. Il est produit par `tools/strip_dfu.py`, avec CRC et taille vérifiés. Il est utile si l'installeur affichait une erreur avec le fichier d'origine.
+## 5. Tes réponses et ce qu'elles montrent
 
-## 5. Fichiers fournis
+| Question | Réponse | Conclusion |
+|---|---|---|
+| Version | 26.3.0 | Même version que celle testée par l'auteur : ce n'est pas un problème de version. |
+| Message de fin de l'installeur | aucun | L'installation n'a **pas de preuve de succès** (voir ci-dessous). |
+| ABLauncher | « Slot A detected » | Départ correct. |
+| Après EXE | écran noir, logo NumWorks, retour sur A | **Redémarrage** : la calculatrice plante dès le saut. Cause typique : il n'y a pas de userland valide et complet à `0x90410000`. |
+
+### Le problème de l'installeur web
+
+Lu dans le code public de la calculatrice (`shared/ion/src/device/shared/usb/dfu_interface.cpp`, `wholeDataSentCallback`) : après chaque effacement ou écriture, la calculatrice remet **toujours** l'état DFU à `dfuDNLOAD-IDLE`, **même si l'opération a échoué**. L'échec n'apparaît que dans le champ `bStatus`.
+
+L'installeur web ne regarde que l'état (`4` puis `5`), jamais `bStatus`, et il ne relit jamais ce qu'il a écrit. Reproduit sur un simulateur de la pile DFU d'Epsilon (`outil/tests/original_installer_test.js`) : écriture refusée → **aucune erreur, et rien n'est écrit**.
+
+Il efface aussi par « pages de 4 Ko », alors que la calculatrice efface un secteur entier de 64 Ko à chaque commande. Chaque secteur est donc effacé 16 fois (≈ 380 effacements pour le userland), ce qui rend l'installation très longue. Un débranchement ou un onglet fermé avant la fin laisse le slot B à moitié vide.
+
+Dans les deux cas, ABLauncher saute dans une zone vide ou incomplète, la calculatrice plante, et elle redémarre sur A : c'est exactement ton symptôme.
+
+### L'outil : `outil/verificateur-slot-b.html`
+
+Page autonome (WebUSB) à ouvrir dans Chrome, Edge ou Brave :
+
+1. **Connexion** : affiche le modèle, la carte mémoire USB annoncée par la calculatrice, le slot en cours et si le slot B est inscriptible.
+2. **Lire le slot B** (lecture seule) : dit si `0x90410000` est vide, contient un userland valide pour N0120, ou autre chose.
+3. **Comparer au .dfu** (lecture seule) : relit tout le slot B et le compare octet par octet au fichier.
+4. **Réinstaller et vérifier** :
+   - efface chaque secteur une seule fois (23 effacements) ;
+   - écrit en vérifiant `bStatus` à chaque commande ;
+   - relit tout et compare.
+
+   Cette étape refuse d'écrire hors de `0x90410000`–`0x907FFFFF` (le slot A n'est jamais touché) et refuse un fichier compilé pour un autre modèle.
+
+Testé sur un simulateur de la pile DFU d'Epsilon (`outil/tests/`, 10 tests) : contenu exact, slot A intact, aucun effacement global, aucun redémarrage, refus détectés, installation partielle détectée. **Pas testé sur une vraie calculatrice.**
+
+## 6. Fichiers fournis
 
 - `patches/0001-Fix-static-initialization-and-theme-area-bounds.patch` : à appliquer sur Salty-OS `2043e93` :
   ```sh
@@ -110,7 +143,12 @@ L'installeur web **efface tous les blocs d'abord, puis écrit**. Si le noyau ref
   ```
   Compilation vérifiée avec le patch : n0120, n0115 et n0110 (`.init_array` vide sur les trois). **Non testé sur une vraie calculatrice** : ce patch corrige les bugs ci-dessus, mais il ne garantit pas, à lui seul, que le saut vers le slot B fonctionnera si la cause est la version ou l'installation (section 2).
 - `dfu/userland.allow3rdparty.B.n0120.sans-persisting-bytes.dfu` : le userland officiel v1.0 pour N0120, sans le bloc `0x907F0000` (section 4).
-- `tools/strip_dfu.py` : script qui a produit ce fichier :
+- `outil/verificateur-slot-b.html` : l'outil de vérification et de réinstallation (section 5).
+- `outil/tests/` : simulateur de la pile DFU d'Epsilon et tests :
+  ```sh
+  node outil/tests/run_tests.js outil/verificateur-slot-b.html userland.allow3rdparty.B.n0120.dfu
+  ```
+- `tools/strip_dfu.py` : script qui a produit le fichier sans persisting bytes :
   ```sh
   python3 tools/strip_dfu.py userland.allow3rdparty.B.n0120.dfu sortie.dfu 90410000
   ```

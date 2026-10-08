@@ -1,0 +1,566 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vérificateur slot B</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #5d6677;
+    --border: #d9dee7; --accent: #c2410c; --ok: #15803d; --err: #b91c1c;
+    --warn: #a16207; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14171c; --card: #1d2128; --text: #e6e9ef; --muted: #9aa3b2;
+            --border: #313744; --accent: #fb923c; --ok: #4ade80; --err: #f87171;
+            --warn: #facc15; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  .lead { color: var(--muted); margin: 0 0 20px; }
+  section { background: var(--card); border: 1px solid var(--border);
+            border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+  h2 { font-size: 1rem; margin: 0 0 8px; }
+  h2 span { color: var(--accent); margin-right: 6px; }
+  p { margin: 6px 0; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; cursor: pointer;
+           border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+  button.secondary { background: transparent; color: var(--accent); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 8px 0 0; }
+  dt { color: var(--muted); }
+  dd { margin: 0; font-family: var(--mono); font-size: .9em; word-break: break-all; }
+  .verdict { margin-top: 10px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); }
+  .verdict.ok { border-color: var(--ok); color: var(--ok); }
+  .verdict.err { border-color: var(--err); color: var(--err); }
+  .verdict.warn { border-color: var(--warn); color: var(--warn); }
+  .hidden { display: none; }
+  progress { width: 100%; height: 10px; margin-top: 10px; }
+  #log { font-family: var(--mono); font-size: .82em; white-space: pre-wrap;
+         max-height: 260px; overflow: auto; margin: 0; color: var(--muted); }
+  label { display: inline-flex; gap: 6px; align-items: center; }
+  .danger { color: var(--err); font-size: .9em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Vérificateur du slot B</h1>
+  <p class="lead">NumWorks N0110 / N0115 / N0120. À ouvrir dans Chrome, Edge ou Brave (WebUSB).
+    Branche la calculatrice allumée sur l'écran d'accueil d'Epsilon (slot A) : elle passe d'elle-même en mode USB.
+    Les étapes 1 à 3 ne font <strong>que lire</strong>.</p>
+
+  <section>
+    <h2><span>1</span>Connexion</h2>
+    <div class="row"><button id="connectBtn">Connecter la calculatrice</button></div>
+    <dl id="deviceInfo" class="hidden"></dl>
+    <div id="connectVerdict" class="verdict hidden"></div>
+  </section>
+
+  <section>
+    <h2><span>2</span>Lire l'en-tête du slot B (lecture seule)</h2>
+    <p>Lit les premiers octets à <code>0x90410000</code>, là où ABLauncher saute.</p>
+    <div class="row"><button id="headerBtn" disabled>Lire le slot B</button></div>
+    <dl id="headerInfo" class="hidden"></dl>
+    <div id="headerVerdict" class="verdict hidden"></div>
+  </section>
+
+  <section>
+    <h2><span>3</span>Comparer le slot B au fichier .dfu (lecture seule)</h2>
+    <div class="row">
+      <input id="fileInput" type="file" accept=".dfu">
+    </div>
+    <dl id="fileInfo" class="hidden"></dl>
+    <div class="row">
+      <label><input id="skipPersisting" type="checkbox" checked> Ignorer le bloc 0x907F0000 (persisting bytes)</label>
+    </div>
+    <div class="row"><button id="compareBtn" disabled>Comparer</button></div>
+    <div id="compareVerdict" class="verdict hidden"></div>
+  </section>
+
+  <section>
+    <h2><span>4</span>Réinstaller puis vérifier (écrit dans le slot B)</h2>
+    <p>Efface chaque secteur de 64 Ko <strong>une seule fois</strong>, écrit le fichier, puis relit tout et compare.
+      N'écrit que dans le slot B (<code>0x90410000</code>–<code>0x907FFFFF</code>) : le slot A n'est jamais touché.</p>
+    <p class="danger">Ne débranche pas le câble et ne touche pas la calculatrice avant le message final.</p>
+    <div class="row"><button id="installBtn" class="secondary" disabled>Réinstaller et vérifier</button></div>
+    <div id="installVerdict" class="verdict hidden"></div>
+  </section>
+
+  <section>
+    <h2>Progression et journal</h2>
+    <progress id="progress" value="0" max="1"></progress>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+'use strict';
+
+/* ---------------------------------------------------------------------------
+ * Pure helpers (no DOM, no USB): DfuSe parsing, memory map, header decoding.
+ * ------------------------------------------------------------------------- */
+
+const SLOT_B_USERLAND = 0x90410000;
+const SLOT_B_WRITE_START = 0x90410000;   // never touch slot B kernel (0x90400000-0x9040FFFF)
+const SLOT_B_END = 0x90800000;
+const PERSISTING_BYTES_B = 0x907F0000;
+const SECTOR_SIZE = 0x10000;             // external flash sectors are 64 KiB in slot B
+const USERLAND_MAGIC = 0xDEC0EDFE;
+const READ_BLOCK = 2048;                 // wTransferSize of the calculator
+const WRITE_BLOCK = 1024;                // same block size as the original installer
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+// DfuSe stores ~crc32 (no final xor) of everything before the CRC field.
+function dfuseCrc(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return c >>> 0;
+}
+
+function parseDfuSe(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+  const ascii = (o, n) => String.fromCharCode(...bytes.slice(o, o + n));
+  if (bytes.length < 11 + 16 || ascii(0, 5) !== 'DfuSe') throw new Error('Fichier .dfu invalide (en-tête DfuSe absent).');
+  if (ascii(bytes.length - 8, 3) !== 'UFD') throw new Error('Fichier .dfu invalide (suffixe DFU absent).');
+  const storedCrc = view.getUint32(bytes.length - 4, true);
+  const crcOk = dfuseCrc(bytes.subarray(0, bytes.length - 4)) === storedCrc;
+  const targets = bytes[10];
+  let off = 11;
+  const elements = [];
+  for (let t = 0; t < targets; t++) {
+    if (ascii(off, 6) !== 'Target') throw new Error('Fichier .dfu invalide (cible ' + t + ').');
+    const count = view.getUint32(off + 270, true);
+    off += 274;
+    for (let e = 0; e < count; e++) {
+      const address = view.getUint32(off, true);
+      const size = view.getUint32(off + 4, true);
+      off += 8;
+      if (off + size > bytes.length - 16) throw new Error('Fichier .dfu tronqué.');
+      elements.push({ address, data: bytes.slice(off, off + size) });
+      off += size;
+    }
+  }
+  return { elements, crcOk };
+}
+
+function decodeUserlandHeader(bytes) {
+  const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const u32 = (o) => v.getUint32(o, true);
+  let version = '';
+  for (let i = 4; i < 12 && bytes[i] !== 0; i++) version += String.fromCharCode(bytes[i]);
+  return {
+    magic: u32(0), footer: u32(44), version,
+    externalAppsStart: u32(20), stackPointer: u32(48), reset: u32(52),
+  };
+}
+
+const hex = (n) => '0x' + (n >>> 0).toString(16).toUpperCase().padStart(8, '0');
+
+function modelFromBcd(major, minor, subminor) {
+  return 'n' + ((major << 8) | (minor << 4) | subminor).toString(16).padStart(4, '0');
+}
+
+// RAM base of the userland for a model, or of a userland built for it.
+function ramBaseForModel(model) {
+  return model === 'n0120' ? 0x24000000 : 0x20000000;
+}
+
+// "@Flash/0x90030000/61*064Kg,64*064Kg" -> [{start, end, writable}]
+function parseMemoryMap(name) {
+  if (!name || name[0] !== '@') return null;
+  const parts = name.split('/');
+  const ranges = [];
+  for (let i = 1; i + 1 < parts.length; i += 2) {
+    let addr = parseInt(parts[i], 16);
+    if (Number.isNaN(addr)) return null;
+    for (const seg of parts[i + 1].split(',')) {
+      const m = /^(\d+)\*(\d+)([ KM ]?)([a-g])$/.exec(seg.trim());
+      if (!m) return null;
+      const unit = m[3] === 'K' ? 1024 : m[3] === 'M' ? 1024 * 1024 : 1;
+      const len = parseInt(m[1], 10) * parseInt(m[2], 10) * unit;
+      const type = m[4].charCodeAt(0) - 0x60;  // a=1 ... g=7: bit0 read, bit1 erase, bit2 write
+      ranges.push({ start: addr, end: addr + len, writable: (type & 6) === 6 });
+      addr += len;
+    }
+  }
+  return ranges;
+}
+
+function rangeWritable(map, start, end) {
+  if (!map) return null;
+  let cursor = start;
+  for (const r of [...map].sort((a, b) => a.start - b.start)) {
+    if (r.writable && r.start <= cursor && r.end > cursor) cursor = r.end;
+    if (cursor >= end) return true;
+  }
+  return cursor >= end;
+}
+
+function runningSlotFromMap(name) {
+  if (!name) return '?';
+  if (name.startsWith('@Flash/0x90030000/')) return 'A';
+  if (name.startsWith('@Flash/0x90000000/') || name.startsWith('@Flash/0x90430000/')) return 'B';
+  return '?';
+}
+
+/* ---------------------------------------------------------------------------
+ * DFU protocol (works on any object exposing WebUSB's controlTransferIn/Out).
+ * Mirrors shared/ion/src/device/shared/usb/dfu_interface.cpp of Epsilon.
+ * ------------------------------------------------------------------------- */
+
+const DFU = { DNLOAD: 1, UPLOAD: 2, GETSTATUS: 3, CLRSTATUS: 4, ABORT: 6 };
+const STATE = { IDLE: 2, DNBUSY: 4, DNLOADIDLE: 5, UPLOADIDLE: 9, ERROR: 10 };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const setup = (request, value = 0) => ({ requestType: 'class', recipient: 'interface', request, value, index: 0 });
+
+async function getStatus(dev) {
+  const r = await dev.controlTransferIn(setup(DFU.GETSTATUS), 6);
+  if (r.status !== 'ok' || !r.data || r.data.byteLength < 6) throw new Error('GETSTATUS sans réponse');
+  const d = r.data;
+  return { status: d.getUint8(0), poll: d.getUint8(1) | (d.getUint8(2) << 8) | (d.getUint8(3) << 16), state: d.getUint8(4) };
+}
+
+async function resetState(dev) {
+  let s = await getStatus(dev);
+  if (s.state === STATE.ERROR) {
+    await dev.controlTransferOut(setup(DFU.CLRSTATUS));
+    s = await getStatus(dev);
+  }
+  if (s.state !== STATE.IDLE) {
+    await dev.controlTransferOut(setup(DFU.ABORT));
+    s = await getStatus(dev);
+  }
+  if (s.state !== STATE.IDLE) throw new Error('La calculatrice ne revient pas à l\'état DFU idle (état ' + s.state + ').');
+}
+
+// Sends a DNLOAD and waits until the calculator has executed it.
+async function dnload(dev, value, payload, what) {
+  const r = await dev.controlTransferOut(setup(DFU.DNLOAD, value), payload);
+  if (r.status !== 'ok') throw new Error(what + ' : transfert refusé (' + r.status + ')');
+  let s = await getStatus(dev);
+  for (let i = 0; s.state === STATE.DNBUSY && i < 200; i++) {
+    await sleep(s.poll);
+    s = await getStatus(dev);
+  }
+  /* The calculator always goes back to dfuDNLOADIDLE after executing a
+   * command, even when the erase/write failed: the failure is only visible in
+   * bStatus (dfu_interface.cpp, wholeDataSentCallback). Check both. */
+  if (s.state !== STATE.DNLOADIDLE || s.status !== 0) {
+    throw new Error(what + ' : refusé par la calculatrice (état ' + s.state + ', statut ' + s.status + ')');
+  }
+}
+
+function command(code, address) {
+  const b = new Uint8Array(5);
+  b[0] = code;
+  new DataView(b.buffer).setUint32(1, address >>> 0, true);
+  return b;
+}
+
+const setAddress = (dev, a) => dnload(dev, 0, command(0x21, a), 'Adresse ' + hex(a));
+const eraseSector = (dev, a) => dnload(dev, 0, command(0x41, a), 'Effacement ' + hex(a));
+
+async function writeRange(dev, address, data, onProgress) {
+  for (let off = 0; off < data.length; off += WRITE_BLOCK) {
+    const chunk = data.subarray(off, Math.min(off + WRITE_BLOCK, data.length));
+    await setAddress(dev, address + off);
+    await dnload(dev, 2, chunk, 'Écriture ' + hex(address + off));
+    onProgress && onProgress(off + chunk.length);
+  }
+}
+
+async function readRange(dev, address, length, onProgress) {
+  await resetState(dev);
+  await setAddress(dev, address);
+  await dev.controlTransferOut(setup(DFU.ABORT));  // dfuDNLOADIDLE -> dfuIDLE, required before UPLOAD
+  const out = new Uint8Array(length);
+  for (let off = 0, block = 2; off < length; off += READ_BLOCK, block++) {
+    const n = Math.min(READ_BLOCK, length - off);
+    const r = await dev.controlTransferIn(setup(DFU.UPLOAD, block), n);
+    if (r.status !== 'ok' || !r.data || r.data.byteLength !== n) {
+      throw new Error('Lecture ' + hex(address + off) + ' : ' + (r.data ? r.data.byteLength : 0) + ' octets reçus au lieu de ' + n);
+    }
+    out.set(new Uint8Array(r.data.buffer, r.data.byteOffset, n), off);
+    onProgress && onProgress(off + n);
+  }
+  await dev.controlTransferOut(setup(DFU.ABORT));
+  return out;
+}
+
+function firstMismatch(a, b) {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return i;
+  return -1;
+}
+
+function selectElements(dfu, skipPersisting) {
+  return dfu.elements.filter((e) => !(skipPersisting && e.address === PERSISTING_BYTES_B));
+}
+
+// Throws if the file must not be written by this tool.
+function checkInstallable(elements, model, map) {
+  if (!elements.length) throw new Error('Aucun bloc à écrire.');
+  for (const e of elements) {
+    const end = e.address + e.data.length;
+    if (e.address < SLOT_B_WRITE_START || end > SLOT_B_END) {
+      throw new Error('Bloc ' + hex(e.address) + ' hors du slot B : refusé.');
+    }
+    if (rangeWritable(map, e.address, end) === false) {
+      throw new Error('La calculatrice n\'autorise pas l\'écriture de ' + hex(e.address) + '–' + hex(end) + '.');
+    }
+  }
+  const userland = elements.find((e) => e.address === SLOT_B_USERLAND);
+  if (userland) {
+    const h = decodeUserlandHeader(userland.data.subarray(0, 64));
+    if (h.magic !== USERLAND_MAGIC) throw new Error('Le fichier ne contient pas de userland valide à 0x90410000.');
+    if (model && (h.stackPointer & 0xFF000000) !== ramBaseForModel(model)) {
+      throw new Error('Ce fichier n\'est pas compilé pour un ' + model.toUpperCase() + ' (pile ' + hex(h.stackPointer) + ').');
+    }
+  }
+}
+
+async function compareElements(dev, elements, onProgress) {
+  const total = elements.reduce((s, e) => s + e.data.length, 0);
+  let done = 0;
+  const results = [];
+  for (const e of elements) {
+    const got = await readRange(dev, e.address, e.data.length, (n) => onProgress && onProgress(done + n, total));
+    const at = firstMismatch(e.data, got);
+    let differing = 0, erased = 0;
+    for (let i = 0; i < got.length; i++) {
+      if (got[i] !== e.data[i]) differing++;
+      if (got[i] === 0xFF) erased++;
+    }
+    results.push({ address: e.address, length: e.data.length, firstMismatch: at, differing, erasedRatio: erased / got.length });
+    done += e.data.length;
+  }
+  return results;
+}
+
+async function install(dev, elements, log, onProgress) {
+  const sectors = new Set();
+  for (const e of elements) {
+    for (let a = Math.floor(e.address / SECTOR_SIZE) * SECTOR_SIZE; a < e.address + e.data.length; a += SECTOR_SIZE) sectors.add(a);
+  }
+  const sorted = [...sectors].sort((a, b) => a - b);
+  const writeTotal = elements.reduce((s, e) => s + e.data.length, 0);
+  const total = sorted.length * SECTOR_SIZE + writeTotal;
+  await resetState(dev);
+  log('Effacement de ' + sorted.length + ' secteurs de 64 Ko (' + hex(sorted[0]) + '–' + hex(sorted[sorted.length - 1] + SECTOR_SIZE) + ')…');
+  for (let i = 0; i < sorted.length; i++) {
+    await eraseSector(dev, sorted[i]);
+    onProgress((i + 1) * SECTOR_SIZE, total);
+  }
+  let written = 0;
+  for (const e of elements) {
+    log('Écriture de ' + e.data.length + ' octets à ' + hex(e.address) + '…');
+    await writeRange(dev, e.address, e.data, (n) => onProgress(sorted.length * SECTOR_SIZE + written + n, total));
+    written += e.data.length;
+  }
+  log('Relecture et comparaison…');
+  return compareElements(dev, elements, (n, t) => onProgress(n, t));
+}
+
+const SlotBCore = {
+  parseDfuSe, decodeUserlandHeader, parseMemoryMap, rangeWritable, runningSlotFromMap,
+  modelFromBcd, ramBaseForModel, readRange, compareElements, install, checkInstallable,
+  selectElements, dfuseCrc, hex, SLOT_B_USERLAND,
+};
+if (typeof module !== 'undefined') module.exports = SlotBCore;
+
+/* ---------------------------------------------------------------------------
+ * User interface
+ * ------------------------------------------------------------------------- */
+
+if (typeof document !== 'undefined') {
+  const $ = (id) => document.getElementById(id);
+  const ui = {
+    connectBtn: $('connectBtn'), headerBtn: $('headerBtn'), compareBtn: $('compareBtn'),
+    installBtn: $('installBtn'), fileInput: $('fileInput'), skip: $('skipPersisting'),
+    progress: $('progress'), log: $('log'),
+  };
+  let dev = null, model = null, memoryMap = null, dfuFile = null, busy = false;
+
+  function log(msg) {
+    const t = new Date().toLocaleTimeString('fr-FR');
+    ui.log.textContent += '[' + t + '] ' + msg + '\n';
+    ui.log.scrollTop = ui.log.scrollHeight;
+  }
+  function verdict(id, kind, html) {
+    const el = $(id);
+    el.className = 'verdict ' + kind;
+    el.innerHTML = html;
+  }
+  function fillDl(id, rows) {
+    const dl = $(id);
+    dl.innerHTML = '';
+    for (const [k, v] of rows) {
+      const dt = document.createElement('dt'); dt.textContent = k;
+      const dd = document.createElement('dd'); dd.textContent = v;
+      dl.append(dt, dd);
+    }
+    dl.classList.remove('hidden');
+  }
+  function progress(done, total) { ui.progress.max = total || 1; ui.progress.value = done; }
+  function refreshButtons() {
+    ui.headerBtn.disabled = busy || !dev;
+    ui.compareBtn.disabled = busy || !dev || !dfuFile;
+    ui.installBtn.disabled = busy || !dev || !dfuFile;
+  }
+  async function run(fn) {
+    busy = true; refreshButtons();
+    try { await fn(); } catch (e) { log('ERREUR : ' + e.message); throw e; }
+    finally { busy = false; refreshButtons(); }
+  }
+
+  window.addEventListener('beforeunload', (e) => { if (busy) { e.preventDefault(); e.returnValue = ''; } });
+
+  if (!('usb' in navigator)) {
+    verdict('connectVerdict', 'err', 'WebUSB indisponible ici. Ouvre ce fichier dans <strong>Chrome, Edge ou Brave</strong> (sur ordinateur).');
+    ui.connectBtn.disabled = true;
+  }
+
+  ui.connectBtn.addEventListener('click', () => run(async () => {
+    try {
+      dev = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x0483 }] });
+    } catch (e) {
+      verdict('connectVerdict', 'err', 'Aucune calculatrice choisie.');
+      return;
+    }
+    await dev.open();
+    if (dev.configuration === null) await dev.selectConfiguration(dev.configurations[0].configurationValue);
+    await dev.claimInterface(0);
+    model = modelFromBcd(dev.deviceVersionMajor, dev.deviceVersionMinor, dev.deviceVersionSubminor);
+    const alt0 = dev.configuration.interfaces[0].alternates.find((a) => a.alternateSetting === 0) || dev.configuration.interfaces[0].alternates[0];
+    const mapName = alt0 && alt0.interfaceName;
+    memoryMap = parseMemoryMap(mapName);
+    const slot = runningSlotFromMap(mapName);
+    const writable = rangeWritable(memoryMap, SLOT_B_USERLAND, SLOT_B_END);
+    fillDl('deviceInfo', [
+      ['Modèle', model.toUpperCase()],
+      ['Produit', (dev.productName || '?') + ' (' + hex(dev.productId).slice(-4) + ')'],
+      ['Carte mémoire USB', mapName || '(non fournie)'],
+      ['Slot en cours', slot],
+      ['Slot B inscriptible', writable === null ? '?' : writable ? 'oui' : 'NON'],
+    ]);
+    log('Connecté : ' + model + ', carte mémoire « ' + mapName + ' »');
+    if (slot === 'B') {
+      verdict('connectVerdict', 'err', 'La calculatrice tourne sur le <strong>slot B</strong>. Reviens d\'abord sur le slot A.');
+    } else if (writable === false) {
+      verdict('connectVerdict', 'err', 'La calculatrice <strong>n\'autorise pas l\'écriture du slot B</strong> depuis ce slot. Toute installation sur B échouera.');
+    } else {
+      verdict('connectVerdict', 'ok', 'Connectée sur le slot ' + slot + '. Passe à l\'étape 2.');
+    }
+  }).catch(() => {}));
+
+  ui.headerBtn.addEventListener('click', () => run(async () => {
+    log('Lecture de 64 octets à ' + hex(SLOT_B_USERLAND) + '…');
+    const bytes = await readRange(dev, SLOT_B_USERLAND, 64, null);
+    const h = decodeUserlandHeader(bytes);
+    const allFF = bytes.every((b) => b === 0xFF);
+    fillDl('headerInfo', [
+      ['Magic', hex(h.magic) + (h.magic === USERLAND_MAGIC ? ' (valide)' : '')],
+      ['Version', h.version || '—'],
+      ['Pile initiale', hex(h.stackPointer)],
+      ['Point d\'entrée', hex(h.reset)],
+    ]);
+    if (allFF) {
+      verdict('headerVerdict', 'err', 'Le slot B est <strong>vide (effacé)</strong> à cet endroit : l\'installation n\'a pas abouti. ABLauncher saute dans le vide, d\'où le redémarrage sur A. Fais l\'étape 4.');
+    } else if (h.magic === USERLAND_MAGIC && h.footer === USERLAND_MAGIC) {
+      const okModel = (h.stackPointer & 0xFF000000) === ramBaseForModel(model);
+      if (!okModel) {
+        verdict('headerVerdict', 'err', 'Un userland est présent mais <strong>compilé pour un autre modèle</strong> que ' + model.toUpperCase() + '.');
+      } else {
+        verdict('headerVerdict', 'ok', 'Un userland valide pour ' + model.toUpperCase() + ' est présent (version ' + h.version + '). Fais l\'étape 3 pour vérifier qu\'il est complet.');
+      }
+    } else {
+      verdict('headerVerdict', 'err', 'Il n\'y a <strong>pas de userland</strong> à 0x90410000 (contenu inconnu, probablement le firmware officiel du slot B). L\'installation n\'a pas été faite à cet endroit. Fais l\'étape 4.');
+    }
+  }).catch(() => {}));
+
+  ui.fileInput.addEventListener('change', async () => {
+    dfuFile = null;
+    const f = ui.fileInput.files[0];
+    if (!f) { refreshButtons(); return; }
+    try {
+      const parsed = parseDfuSe(await f.arrayBuffer());
+      dfuFile = { name: f.name, ...parsed };
+      const rows = [['Fichier', f.name], ['CRC', parsed.crcOk ? 'valide' : 'INVALIDE']];
+      for (const e of parsed.elements) rows.push(['Bloc ' + hex(e.address), e.data.length + ' octets']);
+      const u = parsed.elements.find((e) => e.address === SLOT_B_USERLAND);
+      if (u) {
+        const h = decodeUserlandHeader(u.data.subarray(0, 64));
+        rows.push(['Version', h.version], ['Pile initiale', hex(h.stackPointer)]);
+      }
+      fillDl('fileInfo', rows);
+      log('Fichier chargé : ' + f.name + ' (' + parsed.elements.length + ' bloc(s))');
+      if (!parsed.crcOk) log('ATTENTION : CRC du fichier invalide (fichier corrompu ?)');
+    } catch (e) {
+      log('ERREUR fichier : ' + e.message);
+    }
+    refreshButtons();
+  });
+
+  function showCompare(id, results, prefix) {
+    const bad = results.filter((r) => r.firstMismatch !== -1);
+    for (const r of results) {
+      log(hex(r.address) + ' : ' + (r.firstMismatch === -1 ? 'identique' :
+        r.differing + ' octets différents, premier à ' + hex(r.address + r.firstMismatch) +
+        ', ' + Math.round(r.erasedRatio * 100) + ' % à 0xFF'));
+    }
+    if (!bad.length) {
+      verdict(id, 'ok', prefix + 'Le slot B contient <strong>exactement</strong> le fichier. L\'installation est bonne.');
+    } else if (bad.every((r) => r.erasedRatio > 0.9)) {
+      verdict(id, 'err', prefix + 'Le slot B est <strong>effacé</strong> : l\'écriture n\'a pas eu lieu.');
+    } else {
+      verdict(id, 'err', prefix + 'Le slot B <strong>ne correspond pas</strong> au fichier (installation incomplète ou autre fichier). Voir le journal.');
+    }
+    return !bad.length;
+  }
+
+  ui.compareBtn.addEventListener('click', () => run(async () => {
+    const elements = selectElements(dfuFile, ui.skip.checked);
+    log('Comparaison de ' + elements.length + ' bloc(s)…');
+    const results = await compareElements(dev, elements, progress);
+    showCompare('compareVerdict', results, '');
+  }).catch((e) => verdict('compareVerdict', 'err', 'Erreur : ' + e.message)));
+
+  ui.installBtn.addEventListener('click', () => run(async () => {
+    const elements = selectElements(dfuFile, ui.skip.checked);
+    checkInstallable(elements, model, memoryMap);
+    if (!confirm('Écrire ' + dfuFile.name + ' dans le slot B ? Ne débranche pas pendant l\'opération.')) return;
+    let wakeLock = null;
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { /* optional */ }
+    try {
+      const results = await install(dev, elements, log, progress);
+      const ok = showCompare('installVerdict', results, '');
+      log(ok ? 'TERMINÉ : installation vérifiée.' : 'TERMINÉ AVEC ERREUR.');
+    } finally {
+      if (wakeLock) wakeLock.release().catch(() => {});
+    }
+  }).catch((e) => verdict('installVerdict', 'err', 'Échec : ' + e.message)));
+
+  navigator.usb && navigator.usb.addEventListener('disconnect', (e) => {
+    if (dev && e.device === dev) {
+      dev = null;
+      log('Calculatrice déconnectée.');
+      refreshButtons();
+    }
+  });
+}
+</script>
+</body>
+</html>
